@@ -37,6 +37,17 @@ jobs:
         run: |
           mkdir -p market_watch/data
 
+      - name: Debug paths (list files)        
+        run: |          
+          echo "PWD:"          
+          pwd          
+          echo "Root listing:"          
+          ls -la          
+          echo "market_watch listing:"
+          ls -la market_watch || echo "market_watch folder NOT FOUND"
+          echo "Case variants listing:"
+          ls -la Market_watch || echo "Market_watch folder NOT FOUND"
+
       # 5) Correr o script
       - name: Run alert script
         working-directory: market_watch
