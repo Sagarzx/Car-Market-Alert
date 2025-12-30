@@ -38,7 +38,7 @@ jobs:
         run: |
           mkdir -p market_watch/data
 
-      # 5) Executar o script (caminho confirmado pelos teus logs)
+      # 5) Executar o script como MÓDULO (corrige imports relativos)
       - name: Run alert script
         env:
           # --- Segredos obrigatórios ---
@@ -55,8 +55,9 @@ jobs:
           MAX_KM: "200000"               # km máximo (aceita km desconhecido)
           RATE_LIMIT: "1.0"              # chamadas/s
           UA: "Mozilla/5.0 (compatible; MarketBot/1.3; +https://example.com/botinfo)"  # user-agent
+          LOG_LEVEL: "INFO"              # usa "DEBUG" se quiseres mais detalhe de logs
         run: |
-          python market_watch/market_watch/main.py
+          python -m market_watch.market_watch.main
 
       # 6) (Opcional) Comitar o histórico atualizado (ex.: market_watch/data/market.csv)
       - name: Commit updated market history (optional)
