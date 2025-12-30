@@ -1,481 +1,346 @@
 
+# market_watch/market_watch/main.py
+# -*- coding: utf-8 -*-
+"""
+Car Market Watch - main
+- Consolida scraping (OLX, Standvirtual, etc.)
+- Mantém histórico em CSV
+- Evita FutureWarning do pandas na concatenação com DataFrames vazios/all-NA
+- Suporta envio de alertas (se houver módulo/funcão send_alerts no projeto)
+
+Estrutura de pastas esperada:
+  market_watch/
+    ├─ data/                    # histórico gravado aqui (market.csv)
+    └─ market_watch/
+        ├─ main.py              # ESTE ficheiro
+        ├─ olx.py               # (opcional) contém scrape_olx()
+        ├─ standvirtual.py      # (opcional) contém scrape_standvirtual()
+        └─ alerts.py            # (opcional) contém send_alerts(df_new, df_all, cfg)
+
+Se algum destes módulos não existir, o programa continua e grava apenas o histórico.
+"""
+
 import os
-import re
-import csv
-import asyncio
+import sys
+import time
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urljoin
+from typing import Iterable, List, Optional, Dict
 
 import pandas as pd
-from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
-from telegram import Bot
 
-# ---------------- Configurações ----------------
-UA = os.getenv("UA", "Mozilla/5.0 (compatible; MarketBot/1.3; +https://example.com/botinfo)")
-ROLLING_DAYS = int(os.getenv("ROLLING_DAYS", "30"))             # janela móvel para referência
-ALERT_MARGIN = float(os.getenv("ALERT_MARGIN", "0.15"))         # -15% vs referência (margem de lucro)
-RATE_LIMIT = float(os.getenv("RATE_LIMIT", "1.0"))              # requests/segundo
-MAX_PAGES = int(os.getenv("MAX_PAGES", "2"))                    # páginas por fonte (ajusta conforme)
-MIN_SAMPLE = int(os.getenv("MIN_SAMPLE", "12"))                 # amostra mínima p/ mediana
 
-# Filtros pedidos
-MIN_PRICE = int(os.getenv("MIN_PRICE", "5000"))                 # €
-MAX_PRICE = int(os.getenv("MAX_PRICE", "15000"))                # €
-MAX_KM    = int(os.getenv("MAX_KM", "200000"))                  # km (aceita km desconhecido)
-
-# Alertas de QUEDA DE PREÇO (para evitar spam)
-DROP_THRESHOLD_PCT = float(os.getenv("DROP_THRESHOLD_PCT", "0.05"))  # >= 5% de queda
-DROP_THRESHOLD_ABS = float(os.getenv("DROP_THRESHOLD_ABS", "250"))   # ou >= €250 de queda
-
-# Enriquecimento de imagens
-IMG_ENRICH = os.getenv("IMG_ENRICH", "1").lower() in {"1","true","yes","on"}
-IMG_CONCURRENCY = int(os.getenv("IMG_CONCURRENCY", "3"))       # nº máx de páginas em paralelo
-IMG_PAGE_TIMEOUT = int(os.getenv("IMG_PAGE_TIMEOUT", "45000"))  # ms para page.goto do anúncio
-
-# Regiões com prioridade (Lisboa + margens)
-PRIORITY_REGIONS = {
-    "Lisboa","Setúbal","Almada","Oeiras","Cascais","Loures","Sintra",
-    "Amadora","Odivelas","Seixal","Barreiro","Moita","Montijo","Mafra"
-}
-
-# Secrets (GitHub Actions → Secrets)
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-# URLs base e templates de paginação
-OLX_BASE = "https://www.olx.pt"
-OLX_URL  = f"{OLX_BASE}/carros-motos-e-barcos/carros/?page={{page}}"
-SV_BASE  = "https://www.standvirtual.com"
-SV_URL   = f"{SV_BASE}/carros/?page={{page}}"
-
-# Dados persistentes
-DATA_DIR = Path(__file__).resolve().parent / "data"
-DATA_DIR.mkdir(exist_ok=True)
-MARKET_PATH = DATA_DIR / "market.csv"
-
-# Logging
+# ---------------------------------------------------------------------------
+# Configuração de logging
+# ---------------------------------------------------------------------------
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(message)s",
 )
+log = logging.getLogger("market_watch")
 
-# ---------------- Utilidades ----------------
-BRANDS = {
-    "Alfa","Audi","BMW","Chevrolet","Citroën","Cupra","Dacia","Daewoo","Daihatsu","Ferrari","Fiat",
-    "Ford","Honda","Hyundai","Jaguar","Jeep","Kia","Land","Lexus","Mazda","Mercedes","Mini","Mitsubishi",
-    "Nissan","Opel","Peugeot","Renault","Seat","Škoda","Skoda","Smart","Subaru","Suzuki","Tesla","Toyota",
-    "Volkswagen","VW","Volvo","Porsche","Range","Rover","DS","BYD","GWM","MG"
-}
 
-def money(txt: str):
-    """Extrai número em € do texto."""
-    if not txt:
-        return None
-    m = re.search(r"([0-9\.\s]+)\s*€", txt.replace("\xa0", " "))
-    return float(m.group(1).replace(".", "").replace(" ", "")) if m else None
+# ---------------------------------------------------------------------------
+# Constantes e paths
+# ---------------------------------------------------------------------------
+PACKAGE_DIR = Path(__file__).resolve().parent              # market_watch/market_watch
+REPO_ROOT   = PACKAGE_DIR.parent                           # market_watch/
+DATA_DIR    = REPO_ROOT / "data"                           # market_watch/data
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-def km_of(txt: str):
-    """Extrai km do texto."""
-    if not txt:
-        return None
-    m = re.search(r"([0-9\.\s]+)\s*km", txt.lower().replace("\xa0", " "))
-    return float(m.group(1).replace(".", "").replace(" ", "")) if m else None
+CSV_PATH    = DATA_DIR / "market.csv"
 
-def year_of(txt: str):
-    """Extrai ano do texto."""
-    if not txt:
-        return None
-    m = re.search(r"(19|20)\d{2}", txt)
-    return int(m.group(0)) if m else None
+# Ajusta esta lista às tuas colunas reais!
+EXPECTED_COLS: List[str] = [
+    "id",         # identificador único por anúncio (obrigatório para dedup)
+    "source",     # 'olx' | 'standvirtual' | ...
+    "title",      # título do anúncio
+    "price",      # preço (numérico)
+    "km",         # quilometragem (numérico ou NaN)
+    "url",        # link do anúncio
+    "ts",         # timestamp (ISO ou epoch)
+    # Adiciona aqui quaisquer outras colunas que uses (ex.: 'year', 'location', 'images', ...)
+]
 
-def brand_model(title: str):
-    """Heurística mais robusta para marca/modelo a partir do título."""
-    if not title:
-        return None, None
-    toks = title.strip().split()
-    # Normaliza Range Rover / Land Rover
-    if len(toks) >= 2 and f"{toks[0]} {toks[1]}".lower() in {"range rover", "land rover"}:
-        brand = f"{toks[0]} {toks[1]}"
-        model = toks[2] if len(toks) > 2 else None
-        return brand, model
-    # Encontra primeira token que seja marca
-    for i in range(min(3, len(toks))):
-        tok = toks[i].capitalize()
-        if tok in BRANDS:
-            brand = tok
-            model = toks[i+1] if i+1 < len(toks) else None
-            return brand, model
-    # Fallback simples
-    brand = toks[0]
-    model = toks[1] if len(toks) > 1 else None
-    return brand, model
 
-def region_guess(card_text: str):
-    """Marca a região se contiver uma das regiões prioritárias."""
-    low = (card_text or "").lower()
-    for r in PRIORITY_REGIONS:
-        if r.lower() in low:
-            return r
-    return None
+# ---------------------------------------------------------------------------
+# Helpers de ambiente/validação
+# ---------------------------------------------------------------------------
+def _get_env_float(name: str, default: float) -> float:
+    val = os.environ.get(name, str(default))
+    try:
+        return float(val)
+    except Exception:
+        log.warning("Env %s inválido (%r). A usar default=%s", name, val, default)
+        return default
 
-def group_keys(row: dict):
-    """Chaves de agrupamento: nível 1 e fallback nível 2."""
-    k1 = (row.get("marca"), row.get("modelo"), row.get("combustivel"),
-          row.get("caixa"), row.get("regiao"))
-    k2 = (row.get("marca"), row.get("modelo"))
-    return k1, k2
 
-def score_priority(regiao: str, delta_pct: float):
-    """Score para ordenar alertas (maior desconto e boost Lisboa + margens)."""
-    base = -delta_pct  # maior desconto ⇒ maior score
-    if regiao in PRIORITY_REGIONS:
-        base *= 1.15
-    return base
+def _get_env_int(name: str, default: int) -> int:
+    val = os.environ.get(name, str(default))
+    try:
+        return int(float(val))
+    except Exception:
+        log.warning("Env %s inválido (%r). A usar default=%s", name, val, default)
+        return default
 
-# ---------------- Persistência ----------------
-def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
-    cols = ["fonte","titulo","preco","km","ano","combustivel","caixa","regiao",
-            "marca","modelo","link","data",
-            "last_drop_alert_price","last_margin_alert_price","image_url"]
-    for c in cols:
+
+def load_config_from_env() -> Dict[str, object]:
+    """Lê variáveis de ambiente definidas no workflow."""
+    cfg = {
+        "ROLLING_DAYS":         _get_env_int("ROLLING_DAYS", 30),
+        "ALERT_MARGIN":         _get_env_float("ALERT_MARGIN", 0.15),
+        "DROP_THRESHOLD_PCT":   _get_env_float("DROP_THRESHOLD_PCT", 0.05),
+        "DROP_THRESHOLD_ABS":   _get_env_float("DROP_THRESHOLD_ABS", 250.0),
+        "MIN_PRICE":            _get_env_int("MIN_PRICE", 5000),
+        "MAX_PRICE":            _get_env_int("MAX_PRICE", 15000),
+        "MAX_KM":               _get_env_int("MAX_KM", 200000),
+        "RATE_LIMIT":           _get_env_float("RATE_LIMIT", 1.0),  # chamadas/s
+        "UA":                   os.environ.get("UA", "Mozilla/5.0 (compatible; MarketBot/1.3; +https://example.com/botinfo)"),
+        "TELEGRAM_TOKEN":       os.environ.get("TELEGRAM_TOKEN"),
+        "TELEGRAM_CHAT_ID":     os.environ.get("TELEGRAM_CHAT_ID"),
+    }
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Correção do FutureWarning: concat “segura”
+# ---------------------------------------------------------------------------
+def safe_concat(dfs: Iterable[pd.DataFrame], expected_columns: Optional[Iterable[str]] = None) -> pd.DataFrame:
+    """
+    Concatena DataFrames ignorando entradas vazias/all-NA para evitar FutureWarning do pandas,
+    preservando o comportamento atual.
+
+    - dfs: iterável de pd.DataFrame
+    - expected_columns: colunas esperadas (para devolver vazio com esquema correto se necessário)
+    """
+    cleaned: List[pd.DataFrame] = []
+    for d in dfs:
+        if d is None:
+            continue
+        if not isinstance(d, pd.DataFrame):
+            log.warning("safe_concat ignorou item não-DataFrame: %r", type(d))
+            continue
+        if d.empty or d.dropna(how="all").empty:
+            # vazio ou todas as linhas NA → ignora
+            continue
+        cleaned.append(d)
+
+    if not cleaned:
+        if expected_columns is not None:
+            return pd.DataFrame(columns=list(expected_columns))
+        return pd.DataFrame()
+
+    return pd.concat(cleaned, ignore_index=True)
+
+
+# ---------------------------------------------------------------------------
+# I/O do histórico (CSV)
+# ---------------------------------------------------------------------------
+def load_market() -> pd.DataFrame:
+    """
+    Lê o histórico (CSV) e garante as colunas esperadas mesmo se vazio.
+    """
+    if not CSV_PATH.exists():
+        log.info("Histórico não existe ainda: %s", CSV_PATH)
+        return pd.DataFrame(columns=EXPECTED_COLS)
+
+    try:
+        df = pd.read_csv(CSV_PATH)
+    except Exception as e:
+        log.error("Falha ao ler CSV %s: %s", CSV_PATH, e)
+        return pd.DataFrame(columns=EXPECTED_COLS)
+
+    # Garante colunas esperadas
+    for c in EXPECTED_COLS:
         if c not in df.columns:
-            df[c] = None
-    if "data" in df.columns:
-        df["data"] = pd.to_datetime(df["data"]).dt.date
+            df[c] = pd.Series([None] * len(df))
+    # Reordena
+    df = df[EXPECTED_COLS]
+
     return df
 
-def load_market() -> pd.DataFrame:
-    if MARKET_PATH.exists():
-        try:
-            df = pd.read_csv(MARKET_PATH)
-            return _ensure_columns(df)
-        except Exception as e:
-            logging.warning(f"Falha a ler {MARKET_PATH}: {e}")
-    return pd.DataFrame(columns=[
-        "fonte","titulo","preco","km","ano","combustivel","caixa","regiao",
-        "marca","modelo","link","data",
-        "last_drop_alert_price","last_margin_alert_price","image_url"
-    ])
 
-def save_market(df_new: pd.DataFrame) -> pd.DataFrame:
-    df_all = pd.concat([load_market(), df_new], ignore_index=True)
-    df_all = _ensure_columns(df_all)
-    df_all = df_all.dropna(subset=["preco", "link"])
-    df_all.sort_values("data", inplace=True)
-    df_all.drop_duplicates(subset=["fonte", "link"], keep="last", inplace=True)
+def save_market(df: pd.DataFrame) -> None:
+    """
+    Grava o histórico consolidado em CSV.
+    """
     try:
-        df_all.to_csv(MARKET_PATH, index=False, quoting=csv.QUOTE_MINIMAL)
+        df.to_csv(CSV_PATH, index=False)
+        log.info("Histórico gravado: %s (linhas=%d)", CSV_PATH, len(df))
     except Exception as e:
-        logging.error(f"Falha a escrever {MARKET_PATH}: {e}")
-    return df_all
+        log.error("Falha ao gravar CSV %s: %s", CSV_PATH, e)
 
-def recent_market(days: int) -> pd.DataFrame:
-    df = load_market()
-    if len(df) == 0:
-        return df
-    cutoff = datetime.utcnow().date() - timedelta(days=days)
-    return df[df["data"] >= cutoff]
 
-# ---------------- Referência de Preço ----------------
-def compute_reference(df_market: pd.DataFrame, fonte: str, row: dict, rolling_days: int = 30):
+# ---------------------------------------------------------------------------
+# Scraping: tentativa de importar funções existentes no projeto
+# ---------------------------------------------------------------------------
+SCRAPERS = []
+
+# Tenta importar scrape_olx()
+try:
+    from .olx import scrape_olx  # type: ignore
+    SCRAPERS.append(("olx", scrape_olx))
+except Exception as e:
+    log.info("scrape_olx não encontrado (%s) — continuar sem OLX.", e)
+
+# Tenta importar scrape_standvirtual()
+try:
+    from .standvirtual import scrape_standvirtual  # type: ignore
+    SCRAPERS.append(("standvirtual", scrape_standvirtual))
+except Exception as e:
+    log.info("scrape_standvirtual não encontrado (%s) — continuar sem Standvirtual.", e)
+
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Calcula preço de referência (mediana) por grupo:
-    - Nível 1: marca+modelo (+combustível/caixa/região se disponíveis)
-    - Nível 2: marca+modelo
-    - Fallback: vizinhança por ano/km (KNN rudimentar)
+    Ajusta colunas do DataFrame para bater com EXPECTED_COLS.
+    Preenche colunas em falta com None e reordena.
+    Converte price/km para numérico quando possível.
     """
-    sample = df_market[(df_market["fonte"] == fonte) & (df_market["preco"].notna())]
-    sample = sample[sample["data"] >= (datetime.utcnow().date() - timedelta(days=rolling_days))]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=EXPECTED_COLS)
 
-    k1, k2 = group_keys(row)
+    # Garante todas as colunas
+    for c in EXPECTED_COLS:
+        if c not in df.columns:
+            df[c] = pd.Series([None] * len(df))
 
-    s1 = sample[(sample["marca"] == k1[0]) & (sample["modelo"] == k1[1])]
-    if len(s1) >= MIN_SAMPLE:
-        return float(s1["preco"].median())
+    # Converte tipos base
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df["km"]    = pd.to_numeric(df["km"], errors="coerce")
 
-    s2 = sample[(sample["marca"] == k2[0]) & (sample["modelo"] == k2[1])]
-    if len(s2) >= MIN_SAMPLE:
-        return float(s2["preco"].median())
+    # Timestamp: se faltar, coloca agora (UTC ISO)
+    if "ts" in df.columns:
+        mask_missing = df["ts"].isna()
+        if mask_missing.any():
+            df.loc[mask_missing, "ts"] = datetime.now(timezone.utc).isoformat()
+    else:
+        df["ts"] = datetime.now(timezone.utc).isoformat()
 
-    # Fallback: KNN por ano/km (mesmo site)
-    s3 = sample.dropna(subset=["preco","ano","km"])
-    if len(s3) >= MIN_SAMPLE:
-        s3 = s3.copy()
-        s3["dist"] = (abs(s3["ano"] - (row.get("ano") or s3["ano"].median()))/10.0) \
-                   + (abs(s3["km"] - (row.get("km") or s3["km"].median()))/50000.0)
-        neigh = s3.sort_values("dist").head(20)
-        return float(neigh["preco"].median())
-    return None
+    # Reordena
+    return df[EXPECTED_COLS]
 
-# ---------------- Scraping ----------------
-def _extract_image_from_card(c):
-    """Tenta obter URL de imagem diretamente do cartão/listagem."""
-    img = c.select_one("img")
-    if img:
-        for key in ["src", "data-src", "data-thumb-url", "data-srcset"]:
-            val = img.get(key)
-            if val:
-                # Sanear srcset (pega primeira URL)
-                if " " in val and "," in val:
-                    val = val.split(",")[0].split()[0]
-                return val
-    meta = c.select_one("meta[property='og:image']")
-    if meta and meta.get("content"):
-        return meta.get("content")
-    return None
 
-async def fetch_list_page(page, url: str, source: str, card_selector: str, maps: dict, base_url: str):
-    """Faz fetch de uma página de listagem e extrai rows básicas."""
-    await page.goto(url, timeout=60000)
-    await asyncio.sleep(1.0 / max(RATE_LIMIT, 0.1))
-    html = await page.content()
+def get_new_listings(cfg: Dict[str, object]) -> pd.DataFrame:
+    """
+    Executa todos os scrapers disponíveis e consolida num único DataFrame normalizado.
+    Respeita RATE_LIMIT (chamadas/s) entre scrapers.
+    """
+    rate_limit = float(cfg.get("RATE_LIMIT", 1.0))
+    per_call_delay = 1.0 / max(rate_limit, 0.001)
 
-    soup = BeautifulSoup(html, "html.parser")
-    cards = soup.select(card_selector)
-    rows = []
-    for c in cards:
-        t = c.select_one(maps["title"])
-        p = c.select_one(maps["price"])
-        a = c.select_one(maps["link"])
-        meta = c.select_one(maps.get("meta", "p"))
-
-        title = t.get_text(" ", strip=True) if t else None
-        price = money(p.get_text(" ", strip=True)) if p else None
-        raw_link = a.get("href") if a else None
-        link = urljoin(base_url, raw_link) if raw_link else None
-        desc = meta.get_text(" ", strip=True) if meta else ""
-
-        km    = km_of(f"{title} {desc}")
-        ano   = year_of(f"{title} {desc}")
-        marca, modelo = brand_model(title)
-        regiao = region_guess(desc + " " + (title or ""))
-        image_url = _extract_image_from_card(c)
-
-        rows.append({
-            "fonte": source, "titulo": title, "preco": price, "km": km, "ano": ano,
-            "combustivel": None, "caixa": None, "regiao": regiao,
-            "marca": marca, "modelo": modelo,
-            "link": link, "data": datetime.utcnow().date(),
-            "image_url": image_url
-        })
-    return rows
-
-async def scrape_source(ctx, base_url: str, url_tpl: str, source: str, card_selector: str, maps: dict) -> list:
-    """Paginação simples e scraping para uma fonte."""
-    page = await ctx.new_page()
-    out = []
-    for page_num in range(1, MAX_PAGES + 1):
-        url = url_tpl.format(page=page_num)
+    dfs = []
+    for name, fn in SCRAPERS:
+        t0 = time.time()
+        log.info("A iniciar scraping: %s", name)
         try:
-            rows = await fetch_list_page(page, url, source, card_selector, maps, base_url)
-            logging.info(f"{source} página {page_num}: {len(rows)} cards")
-            out.extend(rows)
+            df = fn(cfg)  # cada scraper deve aceitar cfg opcional
+            if df is None:
+                df = pd.DataFrame(columns=EXPECTED_COLS)
+            df = normalize_columns(df)
+            log.info("Scraper %s devolveu %d linhas", name, len(df))
+            dfs.append(df)
         except Exception as e:
-            logging.warning(f"Falha em {source} página {page_num}: {e}")
-    await page.close()
+            log.error("Erro no scraper %s: %s", name, e)
+
+        # Rate limit
+        elapsed = time.time() - t0
+        if elapsed < per_call_delay:
+            time.sleep(per_call_delay - elapsed)
+
+    # Concat segura
+    df_new = safe_concat(dfs, expected_columns=EXPECTED_COLS)
+    return df_new
+
+
+# ---------------------------------------------------------------------------
+# Regras básicas/filters antes de alertar/gravar
+# ---------------------------------------------------------------------------
+def apply_basic_filters(df: pd.DataFrame, cfg: Dict[str, object]) -> pd.DataFrame:
+    """
+    Filtra por preço e km conforme limites do ambiente.
+    (Mantém lógica simples; regras mais avançadas podem existir noutro módulo.)
+    """
+    if df is None or df.empty:
+        return df
+
+    min_price = int(cfg.get("MIN_PRICE", 0))
+    max_price = int(cfg.get("MAX_PRICE", 10**9))
+    max_km    = int(cfg.get("MAX_KM", 10**9))
+
+    mask_price = df["price"].fillna(10**12).between(min_price, max_price)
+    mask_km    = df["km"].fillna(0).le(max_km)
+
+    out = df[mask_price & mask_km].copy()
     return out
 
-# ---------------- Enriquecimento de imagens (og:image) ----------------
-async def _fetch_og_image(ctx, url: str) -> str | None:
-    """Abre a página do anúncio e tenta extrair og:image / twitter:image / primeira img."""
-    page = await ctx.new_page()
+
+# ---------------------------------------------------------------------------
+# Alertas (se existir módulo dedicado no projeto)
+# ---------------------------------------------------------------------------
+def maybe_send_alerts(df_new: pd.DataFrame, df_all: pd.DataFrame, cfg: Dict[str, object]) -> None:
+    """
+    Se existir um módulo/funcão send_alerts, usa-o. Caso contrário, não envia nada.
+    """
     try:
-        await page.goto(url, timeout=IMG_PAGE_TIMEOUT)
-        # dá tempo a JS/render
-        await asyncio.sleep(0.5)
-        for selector, attr in [
-            ("meta[property='og:image']", "content"),
-            ("meta[name='twitter:image']", "content"),
-        ]:
-            loc = page.locator(selector).first
-            if await loc.count() > 0:
-                val = await loc.get_attribute(attr)
-                if val and val.startswith("http"):
-                    return val
-        # fallback: primeira <img> absoluta
-        img = page.locator("img").first
-        if await img.count() > 0:
-            src = await img.get_attribute("src")
-            if src and src.startswith("http"):
-                return src
+        from .alerts import send_alerts  # type: ignore
+    except Exception:
+        log.info("Módulo de alertas não encontrado — a correr sem envio de Telegram.")
+        return
+
+    # Chama com o DataFrame filtrado (podes mudar para df_new sem filtros se preferires)
+    df_filtered = apply_basic_filters(df_new, cfg)
+    try:
+        send_alerts(df_filtered, df_all, cfg)
+        log.info("Alertas enviados (se houver regras).")
     except Exception as e:
-        logging.debug(f"Sem og:image em {url}: {e}")
-    finally:
-        await page.close()
-    return None
+        log.error("Falha no envio de alertas: %s", e)
 
-async def enrich_alert_images(alerts: list):
-    """Para alertas sem image_url, tenta buscar a imagem a partir da página do anúncio."""
-    missing = [a for a in alerts if not a.get("image_url")]
-    if not IMG_ENRICH or not missing:
-        return
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        ctx = await browser.new_context(user_agent=UA)
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main() -> None:
+    log.info("Car Market Watch iniciado.")
+    cfg = load_config_from_env()
 
-        sem = asyncio.Semaphore(max(1, IMG_CONCURRENCY))
-        async def worker(a):
-            async with sem:
-                img = await _fetch_og_image(ctx, a["link"])
-                if img:
-                    a["image_url"] = img
-                await asyncio.sleep(1.0 / max(RATE_LIMIT, 0.1))
+    # 1) Carregar histórico existente
+    df_hist = load_market()
+    log.info("Histórico atual: %d linhas", len(df_hist))
 
-        await asyncio.gather(*(worker(a) for a in missing))
-        await browser.close()
+    # 2) Obter novos anúncios via scrapers disponíveis
+    df_new = get_new_listings(cfg)
+    log.info("Novos anúncios obtidos: %d", len(df_new))
 
-# ---------------- Telegram ----------------
-def send_telegram_alerts(alerts: list):
-    """Envia alertas para Telegram (com foto se disponível)."""
-    token = TELEGRAM_TOKEN
-    chat  = TELEGRAM_CHAT_ID
-    if not token or not chat:
-        logging.warning("⚠️ Define TELEGRAM_TOKEN e TELEGRAM_CHAT_ID nos Secrets.")
-        return
-    bot = Bot(token=token)
-    for a in alerts:
-        caption = (f"[{a['tipo'].upper()} {a['fonte']}] {a['titulo']}\n"
-                   f"Preço: €{a['preco']:.0f} | Referência: {('€'+str(a['ref'])) if a.get('ref') else 's/ ref.'} "
-                   f"| Δ: {a.get('delta_pct_str','-')} \n"
-                   f"Ano: {a.get('ano')} | Km: {a.get('km')} | Região: {a.get('regiao')}\n"
-                   f"{a['link']}")
-        try:
-            if a.get("image_url"):
-                bot.send_photo(chat_id=chat, photo=a["image_url"], caption=caption)
-            else:
-                bot.send_message(chat_id=chat, text=caption)
-        except Exception as e:
-            logging.error(f"Falha a enviar alerta: {e}")
+    # 3) Concat segura: histórico + novos
+    df_all = safe_concat([df_hist, df_new], expected_columns=EXPECTED_COLS)
 
-# ---------------- Ciclo principal ----------------
-async def run_cycle():
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        ctx = await browser.new_context(user_agent=UA)
-
-        # Scraping OLX
-        olx_rows = await scrape_source(
-            ctx, OLX_BASE, OLX_URL, "OLX",
-            card_selector="div[data-cy='l-card']",
-            maps={"title": "h6", "price": "[data-testid='ad-price']", "link": "a", "meta": "p"}
+    # 4) Deduplicação (por id) mantendo o mais recente
+    if "id" in df_all.columns:
+        before = len(df_all)
+        df_all = (
+            df_all.sort_values(by="ts", ascending=True)
+                  .drop_duplicates(subset=["id"], keep="last")
+                  .reset_index(drop=True)
         )
-
-        # Scraping Standvirtual
-        sv_rows = await scrape_source(
-            ctx, SV_BASE, SV_URL, "Standvirtual",
-            card_selector="article",   # pode precisar ajuste
-            maps={"title": "h2", "price": ".price", "link": "a", "meta": "ul"}
-        )
-
-        await browser.close()
-
-    # Consolida
-    df_new = pd.DataFrame(olx_rows + sv_rows)
-
-    # Limpeza básica + filtros pedidos
-    df_new = df_new[df_new["preco"].notna()]
-    df_new = df_new[(df_new["preco"] >= MIN_PRICE) & (df_new["preco"] <= MAX_PRICE)]
-    df_new = df_new[(df_new["km"].isna()) | (df_new["km"] <= MAX_KM)]  # aceita km desconhecido
-
-    if df_new.empty:
-        logging.info("Sem novos anúncios no intervalo de preço/km.")
-        return
-
-    # Carrega histórico anterior
-    df_prev = load_market()
-
-    # Último preço conhecido por fonte+link
-    if len(df_prev) > 0:
-        prev_last = df_prev.sort_values("data").groupby(["fonte","link"]).tail(1)
-        prev_last = prev_last[["fonte","link","preco","last_drop_alert_price","last_margin_alert_price","image_url"]]
-        prev_last = prev_last.rename(columns={"preco":"last_price", "image_url":"prev_image_url"})
-        df_new = df_new.merge(prev_last, on=["fonte","link"], how="left")
+        after = len(df_all)
+        log.info("Deduplicação por id: %d → %d", before, after)
     else:
-        df_new["last_price"] = None
-        df_new["last_drop_alert_price"] = None
-        df_new["last_margin_alert_price"] = None
-        df_new["prev_image_url"] = None
+        log.warning("Coluna 'id' não encontrada — deduplicação não aplicada.")
 
-    # Reutiliza imagem anterior se não veio no cartão
-    df_new["image_url"] = df_new["image_url"].fillna(df_new["prev_image_url"])
+    # 5) Gravar histórico
+    save_market(df_all)
 
-    # Mercado recente para referência
-    df_market = recent_market(ROLLING_DAYS)
+    # 6) Enviar alertas (se módulo existir)
+    maybe_send_alerts(df_new, df_all, cfg)
 
-    alerts = []
+    log.info("Concluído.")
 
-    # --- 1) Alertas de MARGEM (lucro) ---
-    for _, row in df_new.iterrows():
-        ref = compute_reference(df_market, row["fonte"], row, rolling_days=ROLLING_DAYS)
-        if ref:
-            delta_pct = (row["preco"] / ref) - 1.0
-            if (delta_pct <= -ALERT_MARGIN) and (row.get("last_margin_alert_price") != row["preco"]):
-                alerts.append({
-                    "tipo": "Margem",
-                    "fonte": row["fonte"], "titulo": row["titulo"],
-                    "preco": row["preco"], "ref": round(ref, 0),
-                    "delta_pct_str": f"{round(delta_pct*100,1)}%",
-                    "ano": row.get("ano"), "km": row.get("km"),
-                    "regiao": row.get("regiao"), "link": row["link"],
-                    "image_url": row.get("image_url"),
-                    "score": score_priority(row.get("regiao"), delta_pct)
-                })
-                # Evita repetir alerta para a mesma price
-                df_new.loc[df_new["link"] == row["link"], "last_margin_alert_price"] = row["preco"]
 
-    # --- 2) Alertas de QUEDA DE PREÇO ---
-    for _, row in df_new.iterrows():
-        last_price = row.get("last_price")
-        if last_price and (row["preco"] < last_price):
-            drop_abs = last_price - row["preco"]
-            drop_pct = drop_abs / last_price
-            already_alerted_price = row.get("last_drop_alert_price")
-            if (already_alerted_price == row["preco"]):
-                continue
-            if (drop_pct >= DROP_THRESHOLD_PCT) or (drop_abs >= DROP_THRESHOLD_ABS):
-                alerts.append({
-                    "tipo": "Queda",
-                    "fonte": row["fonte"], "titulo": row["titulo"],
-                    "preco": row["preco"], "ref": None,
-                    "delta_pct_str": f"↓ {round(drop_pct*100,1)}% (−€{int(drop_abs)})",
-                    "ano": row.get("ano"), "km": row.get("km"),
-                    "regiao": row.get("regiao"), "link": row["link"],
-                    "image_url": row.get("image_url"),
-                    "score": score_priority(row.get("regiao"), -drop_pct)
-                })
-                df_new.loc[df_new["link"] == row["link"], "last_drop_alert_price"] = row["preco"]
-
-    # Ordena por melhor desconto e prioridade Lisboa+Margens
-    alerts = sorted(alerts, key=lambda x: x["score"], reverse=True)
-    logging.info(f"Total de alertas (antes do enriquecimento de imagens): {len(alerts)}")
-
-    # Enriquecimento de imagens (abre a página do anúncio e tenta obter og:image)
-    await enrich_alert_images(alerts)
-
-    # Envia alertas
-    if alerts:
-        send_telegram_alerts(alerts)
-
-    # Atualiza histórico (com flags e image_url possivelmente enriquecida)
-    # Propaga image_url enriquecida para df_new antes de gravar
-    if alerts:
-        # cria um map link -> image_url
-        link2img = {a["link"]: a.get("image_url") for a in alerts if a.get("image_url")}
-        if link2img:
-            df_new["image_url"] = df_new.apply(
-                lambda r: link2img.get(r["link"], r.get("image_url")), axis=1
-            )
-
-    df_new = df_new.drop(columns=["prev_image_url"]) if "prev_image_url" in df_new.columns else df_new
-    save_market(df_new)
-
-# Entry point
 if __name__ == "__main__":
     try:
-        asyncio.run(run_cycle())
+        main()
     except Exception as e:
-        logging.exception(f"Falha geral na execução: {e}")
+        log.error("Erro fatal no main: %s", e)
+        sys.exit(1)
