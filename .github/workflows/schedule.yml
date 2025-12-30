@@ -10,61 +10,97 @@ jobs:
   run:
     runs-on: ubuntu-latest
 
+    # Necessário apenas se quiseres comitar o histórico (market_watch/data) de volta ao repo
     permissions:
       contents: write
 
     steps:
-      # 1) Checkout
+      # 1) Obter o código do repositório
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2) Python
+      # 2) Preparar o Python
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # 3) Dependências
+      # 3) Instalar dependências do projeto e o browser do Playwright
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          # ⚠️ Ajusta esta linha se o requirements.txt estiver na raiz
           pip install -r market_watch/requirements.txt
           python -m playwright install --with-deps chromium
 
-      # 4) Preparar pasta de dados
+      # 4) Garantir a pasta de dados (histórico)
       - name: Prepare data dir
         run: |
           mkdir -p market_watch/data
 
-      # 4.1) Debug: listar paths (para ver o que existe no runner)
+      # 4.1) Debug: listar paths e procurar o main.py
       - name: Debug paths (list files)
         run: |
+          echo "GITHUB_WORKSPACE: $GITHUB_WORKSPACE"
           echo "PWD:" && pwd
           echo "Root listing:" && ls -la
-          echo "market_watch listing:" && ls -la market_watch || echo "market_watch folder NOT FOUND"
-          echo "Case variants listing:" && ls -la Market_watch || echo "Market_watch folder NOT FOUND"
+          echo "Search for main.py (até 2 níveis):"
+          find . -maxdepth 2 -type f -name "main.py" -print || true
+          echo "Tree (2 níveis):"
+          find . -maxdepth 2 -type d -print
 
-      # 5) Executar script
-      - name: Run alert script
-        working-directory: market_watch
+      # (Opcional) Guardar listagens como artefacto para consulta
+      - name: Save directory listing artifact
+        run: |
+          ls -la > dir_root.txt
+          ls -la market_watch > dir_market_watch.txt || true
+      - name: Upload artifact (dir listing)
+        uses: actions/upload-artifact@v4
+        with:
+          name: dir-listing
+          path: |
+            dir_root.txt
+            dir_market_watch.txt
+
+      # 5) Correr o script com deteção automática de caminho
+      - name: Run alert script (auto-detect path)
         env:
+          # --- Segredos obrigatórios (define em Settings → Secrets and variables → Actions) ---
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          ROLLING_DAYS: "30"
-          ALERT_MARGIN: "0.15"
-          DROP_THRESHOLD_PCT: "0.05"
-          DROP_THRESHOLD_ABS: "250"
-          MIN_PRICE: "5000"
-          MAX_PRICE: "15000"
-          MAX_KM: "200000"
-          RATE_LIMIT: "1.0"
-          UA: "Mozilla/5.0 (compatible; MarketBot/1.3; +https://example.com/botinfo)"
-        run: |
-          echo "Running: python main.py"
-          ls -la
-          python main.py
 
-      # 6) (Opcional) Commit do histórico
+          # --- Parâmetros de execução (podes ajustar aqui ou via Secrets, se preferires) ---
+          ROLLING_DAYS: "30"             # janela do histórico para referência de preço
+          ALERT_MARGIN: "0.15"           # negócio se preço <= -15% da referência
+          DROP_THRESHOLD_PCT: "0.05"     # alerta de queda: >= 5%
+          DROP_THRESHOLD_ABS: "250"      # ou queda absoluta >= €250
+          MIN_PRICE: "5000"              # € mínimo
+          MAX_PRICE: "15000"             # € máximo
+          MAX_KM: "200000"               # km máximo (aceita km desconhecido)
+          RATE_LIMIT: "1.0"              # chamadas/s
+          UA: "Mozilla/5.0 (compatible; MarketBot/1.3; +https://example.com/botinfo)"  # user-agent
+        run: |
+          set -e
+          echo "Workspace: $GITHUB_WORKSPACE"
+          echo "Trying to auto-detect script path..."
+
+          # 1) Caso padrão: market_watch/main.py
+          if [ -f "market_watch/main.py" ]; then
+            echo "Found: market_watch/main.py"
+            python market_watch/main.py
+          else
+            # 2) Procurar qualquer main.py até 3 níveis
+            FOUND=$(find . -maxdepth 3 -type f -name "main.py" | head -n 1)
+            if [ -n "$FOUND" ]; then
+              echo "Found: $FOUND"
+              python "$FOUND"
+            else
+              echo "::error::main.py não encontrado nos primeiros 3 níveis. Verifica a estrutura do repo ou ajusta o caminho no workflow."
+              exit 1
+            fi
+          fi
+
+      # 6) (Opcional) Comitar o histórico atualizado (market_watch/data/market.csv)
       - name: Commit updated market history (optional)
         if: always()
         run: |
