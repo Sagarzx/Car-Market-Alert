@@ -26,7 +26,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pandas requests beautifulsoup4
-          find . -name "requirements.txt" -exec pip install -r {} +
 
       - name: Run alert script
         env:
@@ -37,9 +36,8 @@ jobs:
           ALERT_MARGIN: "0.15"
           RATE_LIMIT: "0.5"
         run: |
-          # Encontra o main.py em qualquer pasta e executa
           MAIN_PATH=$(find . -name "main.py" | head -n 1)
-          echo "Executando: $MAIN_PATH"
+          echo "A executar: $MAIN_PATH"
           export PYTHONPATH=$PYTHONPATH:$(pwd):$(dirname $MAIN_PATH)
           python $MAIN_PATH
 
@@ -48,17 +46,12 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # 1. Adiciona as alterações primeiro para o git saber o que guardar
           git add *.csv || true
           find . -name "market.csv" -exec git add {} +
-          
-          # 2. Faz o commit se houver novidades
           if git diff --staged --quiet; then
             echo "Nada para atualizar."
           else
             git commit -m "Update market history [skip ci]"
-            # 3. Usa o --rebase para evitar o erro de 'unstaged changes' da imagem
             git pull --rebase origin main
             git push origin main
           fi
